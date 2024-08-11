@@ -2,11 +2,12 @@ use std::{
     fs::File,
     io::{Seek, SeekFrom, Write},
     os::{fd::AsRawFd, raw::c_void},
+    process::exit,
 };
 
 use libc::{
     fallocate, madvise, mmap, msync, munmap, MADV_DONTNEED, MADV_RANDOM, MADV_SEQUENTIAL,
-    MADV_WILLNEED, MAP_SHARED, MS_SYNC, PROT_READ, PROT_WRITE,
+    MADV_WILLNEED, MAP_SHARED, MS_ASYNC, MS_SYNC, PROT_READ, PROT_WRITE,
 };
 
 const MAGIC: [u8; 8] = *b"FMAPVEC\0";
@@ -95,15 +96,14 @@ impl<T: Copy> FileMappedVector<T> {
         let data = unsafe { (header as *const u8).add(size_of::<FMVHeader>()) } as *mut T;
 
         // madvise
-        unsafe { madvise(header as *mut c_void, MMAP_SIZE, MADV_DONTNEED) };
         unsafe {
-            madvise(
-                data as *mut c_void,
-                capacity * size_of::<T>(),
-                MADV_SEQUENTIAL,
-            )
+            let header = header as *mut c_void;
+            let data = data as *mut c_void;
+
+            madvise(header, size_of::<FMVHeader>(), MADV_WILLNEED);
+            madvise(data, capacity * size_of::<T>(), MADV_WILLNEED);
+            madvise(data.add(capacity), MMAP_SIZE - capacity * size_of::<T>(), MADV_DONTNEED);
         };
-        unsafe { madvise(header as *mut c_void, size_of::<T>(), MADV_SEQUENTIAL) };
 
         Ok(Self {
             file,
@@ -122,8 +122,8 @@ impl<T: Copy> FileMappedVector<T> {
 
         if header.size >= self.capacity {
             let new_cap = self.capacity * 2;
-            let new_size = size_of::<T>() * new_cap + size_of::<FMVHeader>();
             let old_size = size_of::<T>() * self.capacity + size_of::<FMVHeader>();
+            let size_diff = size_of::<T>() * (new_cap - self.capacity);
 
             // self.file.set_len(new_size as u64).unwrap();
             let ret = unsafe {
@@ -131,7 +131,7 @@ impl<T: Copy> FileMappedVector<T> {
                     self.file.as_raw_fd(),
                     0,
                     old_size as i64,
-                    new_size as i64 - old_size as i64,
+                    size_diff as i64,
                 )
             };
             if ret != 0 {
@@ -139,28 +139,25 @@ impl<T: Copy> FileMappedVector<T> {
             }
 
             unsafe {
-                madvise(self.data as *mut c_void, old_size, MADV_RANDOM);
-                madvise(
-                    self.data.add(old_size) as *mut c_void,
-                    new_size - old_size,
-                    MADV_SEQUENTIAL,
-                );
-                madvise(
-                    self.header as *mut c_void,
-                    size_of::<FMVHeader>(),
-                    MADV_WILLNEED,
-                );
+                let header = self.header as *mut c_void;
+
+                let old_chunk = self.data as *mut c_void;
+                let new_chunk = self.data.add(self.capacity) as *mut c_void;
+
+                madvise(header, size_of::<FMVHeader>(), MADV_DONTNEED);
+
+                madvise(old_chunk, self.capacity * size_of::<T>(), MADV_RANDOM);
+                madvise(new_chunk, size_diff, MADV_SEQUENTIAL);
             }
 
             self.capacity = new_cap;
         }
 
         unsafe {
-            let write_ptr = self.data.add(header.size);
-            write_ptr.write(value);
-
-            header.size += 1;
+            self.data.add(header.size).write(value);
         }
+
+        header.size += 1;
     }
 
     pub fn len(&self) -> usize {
@@ -189,20 +186,34 @@ impl<T: Copy> Drop for FileMappedVector<T> {
 }
 
 fn main() {
-    File::create("fmapvec").unwrap();
-    let file = File::options().read(true).write(true).open("fmapvec").unwrap();
+    let fname = "./test-files/fmapvec";
+
+    File::create(fname).unwrap();
+    let file = File::options().read(true).write(true).open(fname).unwrap();
     let mut vec = FileMappedVector::<u64>::new(file).unwrap();
 
-    for i in 0..10000 {
+    // print my pid
+    println!("My PID: {}", unsafe { libc::getpid() });
+
+    // wait for user input to start
+    // let mut input = String::new();
+    // std::io::stdin().read_line(&mut input).unwrap();
+
+    let start_time = std::time::Instant::now();
+    for i in 0..500_000_000 {
         vec.push(i);
     }
-
     drop(vec);
+    println!("Wrote in: {:?}", start_time.elapsed());
 
-    let file = File::options().read(true).write(true).open("fmapvec").unwrap();
-    let vec = FileMappedVector::<u64>::new(file).unwrap();
+    // let file = File::options().read(true).write(true).open(fname).unwrap();
+    // let vec = FileMappedVector::<u64>::new(file).unwrap();
 
-    for i in 0..vec.len() {
-        println!("{}", vec[i]);
-    }
+    // let start = std::time::Instant::now();
+    // let mut read = 0;
+    // for i in 0..vec.len() {
+    //     read += vec[i];
+    // }
+
+    // println!("Read in: {:?}; output={}", start.elapsed(), read);
 }
